@@ -3,6 +3,7 @@ const BlockStream = require('block-stream2')
 const calcPieceLength = require('piece-length')
 const corePath = require('path')
 const FileReadStream = require('filestream/read')
+const flatten = require('flatten')
 const fs = require('fs')
 const isFile = require('is-file')
 const junk = require('junk')
@@ -12,25 +13,15 @@ const parallel = require('run-parallel')
 const sha1 = require('simple-sha1')
 const stream = require('readable-stream')
 
-// TODO: When Node 10 support is dropped, replace this with Array.prototype.flat
-function flat (arr1) {
-  return arr1.reduce(
-    (acc, val) => Array.isArray(val)
-      ? acc.concat(flat(val))
-      : acc.concat(val),
-    []
-  )
-}
-
 const announceList = [
-  ['udp://tracker.leechers-paradise.org:6969'],
-  ['udp://tracker.coppersurfer.tk:6969'],
-  ['udp://tracker.opentrackr.org:1337'],
-  ['udp://explodie.org:6969'],
-  ['udp://tracker.empire-js.us:1337'],
-  ['wss://tracker.btorrent.xyz'],
-  ['wss://tracker.openwebtorrent.com'],
-  ['wss://tracker.fastcast.nz']
+  [ 'udp://tracker.leechers-paradise.org:6969' ],
+  [ 'udp://tracker.coppersurfer.tk:6969' ],
+  [ 'udp://tracker.opentrackr.org:1337' ],
+  [ 'udp://explodie.org:6969' ],
+  [ 'udp://tracker.empire-js.us:1337' ],
+  [ 'wss://tracker.btorrent.xyz' ],
+  [ 'wss://tracker.openwebtorrent.com' ],
+  [ 'wss://tracker.fastcast.nz' ]
 ]
 
 /**
@@ -41,27 +32,35 @@ const announceList = [
  * @param  {Date=} opts.creationDate
  * @param  {string=} opts.comment
  * @param  {string=} opts.createdBy
+ * @param  {string=} opts.creatorPublicKey
+ * @param  {string=} opts.groupPublicKey
+ * @param  {Object=} opts.creatorMetaSignature  // this signature covers createdBy, creatorPublicKey, groupPublicKey, updateType, version, nextVersionId, comment, chunkMinSize, fileChunks
+ * @param  {string=} opts.updateType
+ * @param  {number=} opts.version
+ * @param  {string=} opts.nextVersionId
+ * @param  {number=} opts.chunkMinSize
  * @param  {boolean|number=} opts.private
  * @param  {number=} opts.pieceLength
  * @param  {Array.<Array.<string>>=} opts.announceList
  * @param  {Array.<string>=} opts.urlList
- * @param  {Object} opts.info
  * @param  {function} cb
  * @return {Buffer} buffer of .torrent file data
  */
-function createTorrent (input, opts, cb) {
-  if (typeof opts === 'function') [opts, cb] = [cb, opts]
+
+
+async function createTorrent (input, opts, cb, raw=false, use_storage=false, pass_object=null) {
+  if (typeof opts === 'function') [ opts, cb ] = [ cb, opts ]
   opts = opts ? Object.assign({}, opts) : {}
 
   _parseInput(input, opts, (err, files, singleFileTorrent) => {
-    if (err) return cb(err)
-    opts.singleFileTorrent = singleFileTorrent
-    onFiles(files, opts, cb)
+    if (err) return cb(err);
+    opts.singleFileTorrent = singleFileTorrent;
+    onFiles(files, opts, cb, raw, use_storage, pass_object);
   })
 }
 
 function parseInput (input, opts, cb) {
-  if (typeof opts === 'function') [opts, cb] = [cb, opts]
+  if (typeof opts === 'function') [ opts, cb ] = [ cb, opts ]
   opts = opts ? Object.assign({}, opts) : {}
   _parseInput(input, opts, cb)
 }
@@ -71,7 +70,7 @@ function parseInput (input, opts, cb) {
  */
 function _parseInput (input, opts, cb) {
   if (isFileList(input)) input = Array.from(input)
-  if (!Array.isArray(input)) input = [input]
+  if (!Array.isArray(input)) input = [ input ]
 
   if (input.length === 0) throw new Error('invalid input type')
 
@@ -180,15 +179,19 @@ function _parseInput (input, opts, cb) {
       const file = {}
 
       if (isBlob(item)) {
+        console.log("it's a blob");
         file.getStream = getBlobStream(item)
         file.length = item.size
       } else if (Buffer.isBuffer(item)) {
+        console.log("it's a buffer");
         file.getStream = getBufferStream(item)
         file.length = item.length
       } else if (isReadable(item)) {
+        console.log("it's readable");
         file.getStream = getStreamStream(item, file)
         file.length = 0
       } else if (typeof item === 'string') {
+        console.log("it's a string");
         if (typeof fs.stat !== 'function') {
           throw new Error('filesystem paths do not work in the browser')
         }
@@ -202,7 +205,7 @@ function _parseInput (input, opts, cb) {
       cb(null, file)
     }), (err, files) => {
       if (err) return cb(err)
-      files = flat(files)
+      files = flatten(files)
       cb(null, files, isSingleFileTorrent)
     })
   }
@@ -212,8 +215,8 @@ function getFiles (path, keepRoot, cb) {
   traversePath(path, getFileInfo, (err, files) => {
     if (err) return cb(err)
 
-    if (Array.isArray(files)) files = flat(files)
-    else files = [files]
+    if (Array.isArray(files)) files = flatten(files)
+    else files = [ files ]
 
     path = corePath.normalize(path)
     if (keepRoot) {
@@ -262,49 +265,122 @@ function notHidden (file) {
   return file[0] !== '.'
 }
 
-function getPieceList (files, pieceLength, cb) {
-  cb = once(cb)
-  const pieces = []
-  let length = 0
+async function getPieceList (upload_instance, files, chunkMinSize, pieceLength, use_storage=false, cb) {
+  console.log('inpiecelist');
+  console.log(files);
+  console.log(upload_instance);
+  cb = once(cb);
+  console.log("after once");
+  const pieces = [];
 
-  const streams = files.map(file => file.getStream)
+  let length = 0;
+  let total_file_length = 0;
+  for (let i=0;i<files.length;i++){
+    total_file_length += files[i].length;
+  }
+  const streams = files.map(file => file.getStream);
+  let blob_key_array = [];
+  let remainingHashes = 0;
+  let pieceNum = 0;
+  let ended = false;
+  const multistream = new MultiStream(streams);
+  console.log("first queue length", multistream._queue.length);
+  const blockstream = new BlockStream(pieceLength, { zeroPadding: false });
 
-  let remainingHashes = 0
-  let pieceNum = 0
-  let ended = false
+  multistream.on('error', onError);
 
-  const multistream = new MultiStream(streams)
-  const blockstream = new BlockStream(pieceLength, { zeroPadding: false })
+  let file_spot = 0;
+  let local_blob_key = await getUniqueStorageId(blob_store);
+  let chunk_blob = new ChunkBlob(local_key=local_blob_key);
 
-  multistream.on('error', onError)
+  console.log("local_torrent_key", upload_instance.local_torrent_key);
+  console.log("before getting stored_torrent - key:", upload_instance.local_torrent_key);
+  let local_torrent_key = upload_instance.local_torrent_key;
+  let stored_torrent = await AgginymTorrent.getItem(local_torrent_key);
+  console.log("after get stored_torrent");
+
+  // this is a shitty way of doing it, find a better way
+  // right now we find the size of the chunks that will be created
+  // add them up until just under the aggregate size on disk of all files
+  // them get the left over chunk size as well.
+  let main_chunk_size = chunkMinSize + pieceLength - chunkMinSize % pieceLength;
+  let full_chunk_count = Math.floor(total_file_length / main_chunk_size);
+  let leftover_chunk_size = total_file_length - full_chunk_count * main_chunk_size;
+  let leftover_chunk = leftover_chunk_size > 0;
+
+  let chunk_array = new Array(full_chunk_count + (leftover_chunk? 1:0));
+  chunk_array.fill(main_chunk_size);
+  if (leftover_chunk){
+    chunk_array[chunk_array.length-1] = leftover_chunk_size;
+  }
+
+  let chunk_offset = 0;
+  let chunk_spot = 0;
 
   multistream
     .pipe(blockstream)
     .on('data', onData)
     .on('end', onEnd)
-    .on('error', onError)
+    .on('error', onError);
 
-  function onData (chunk) {
-    length += chunk.length
+  async function onData (chunk) {
+    length += chunk.length;
 
-    const i = pieceNum
+    //console.log("multistream._queue.length", multistream._queue.length);
+
+    // allocate chunk if needed
+    if (chunk_blob.blob === null){
+      chunk_blob.blob = new Uint8Array(chunk_array[chunk_spot++]);
+    }
+
+    chunk_blob.blob.set(chunk, chunk_offset);
+    chunk_offset += chunk.length;
+    //console.log("chunk_offset:", chunk_offset, "chunk.length:", chunk.length, "pieceLength:", pieceLength);
+    //console.log("chunk_blob.blob.length: ", chunk_blob.blob.length);
+    //console.log("file length: ", files[file_spot].length);
+
+    if (chunk_offset == chunk_blob.blob.length){
+      // we've filled the chunk, do the next one
+      console.log("FILLED THE CHUNK");
+      chunk_offset = 0;
+      currently_saving.add(chunk_blob.local_key); // marking as still saving
+      save_file_chunk(chunk_blob, currently_saving);
+      // set up next blob
+      local_blob_key = await getUniqueStorageId(blob_store);
+      chunk_blob = new ChunkBlob(local_key=local_blob_key);
+    }
+
+    async function save_file_chunk(chunk_b, currently_saving){
+      console.log("iterating chunks");
+      //store blob
+      chunk_b.setItem()
+      blob_key_array.push({key: chunk_b.local_key, hash: sha1.sync(chunk_b.blob)});
+      currently_saving.delete(chunk_b.local_key);  // will be empty when all pieces are done saving
+      // setup next blob
+      //local_blob_key = await getUniqueStorageId(blob_store);
+      //chunk_blob = new ChunkBlob(local_key=local_blob_key);
+    }
+
+    const i = pieceNum;
     sha1(chunk, hash => {
-      pieces[i] = hash
-      remainingHashes -= 1
-      maybeDone()
-    })
-    remainingHashes += 1
-    pieceNum += 1
+      pieces[i] = hash;
+      remainingHashes -= 1;
+      maybeDone();
+    });
+    remainingHashes += 1;
+    pieceNum += 1;    
   }
 
-  function onEnd () {
-    ended = true
-    maybeDone()
+  async function onEnd () {
+    console.log("ended");
+
+    ended = true;
+    maybeDone();
   }
 
   function onError (err) {
-    cleanup()
-    cb(err)
+    cleanup();
+    cb(err);
   }
 
   function cleanup () {
@@ -316,19 +392,19 @@ function getPieceList (files, pieceLength, cb) {
 
   function maybeDone () {
     if (ended && remainingHashes === 0) {
-      cleanup()
-      cb(null, Buffer.from(pieces.join(''), 'hex'), length)
+      cleanup();
+      cb(null, Buffer.from(pieces.join(''), 'hex'), main_chunk_size, blob_key_array, length);
     }
   }
 }
 
-function onFiles (files, opts, cb) {
+async function onFiles (files, opts, cb, raw=false, use_storage=false, pass_object=null) {
   let announceList = opts.announceList
 
   if (!announceList) {
-    if (typeof opts.announce === 'string') announceList = [[opts.announce]]
+    if (typeof opts.announce === 'string') announceList = [ [ opts.announce ] ]
     else if (Array.isArray(opts.announce)) {
-      announceList = opts.announce.map(u => [u])
+      announceList = opts.announce.map(u => [ u ])
     }
   }
 
@@ -336,9 +412,9 @@ function onFiles (files, opts, cb) {
 
   if (global.WEBTORRENT_ANNOUNCE) {
     if (typeof global.WEBTORRENT_ANNOUNCE === 'string') {
-      announceList.push([[global.WEBTORRENT_ANNOUNCE]])
+      announceList.push([ [ global.WEBTORRENT_ANNOUNCE ] ])
     } else if (Array.isArray(global.WEBTORRENT_ANNOUNCE)) {
-      announceList = announceList.concat(global.WEBTORRENT_ANNOUNCE.map(u => [u]))
+      announceList = announceList.concat(global.WEBTORRENT_ANNOUNCE.map(u => [ u ]))
     }
   }
 
@@ -347,7 +423,7 @@ function onFiles (files, opts, cb) {
     announceList = announceList.concat(module.exports.announceList)
   }
 
-  if (typeof opts.urlList === 'string') opts.urlList = [opts.urlList]
+  if (typeof opts.urlList === 'string') opts.urlList = [ opts.urlList ]
 
   const torrent = {
     info: {
@@ -368,8 +444,6 @@ function onFiles (files, opts, cb) {
 
   if (opts.private !== undefined) torrent.info.private = Number(opts.private)
 
-  if (opts.info !== undefined) Object.assign(torrent.info, opts.info)
-
   // "ssl-cert" key is for SSL torrents, see:
   //   - http://blog.libtorrent.org/2012/01/bittorrent-over-ssl/
   //   - http://www.libtorrent.org/manual-ref.html#ssl-torrents
@@ -378,25 +452,176 @@ function onFiles (files, opts, cb) {
 
   if (opts.urlList !== undefined) torrent['url-list'] = opts.urlList
 
-  const pieceLength = opts.pieceLength || calcPieceLength(files.reduce(sumLength, 0))
-  torrent.info['piece length'] = pieceLength
+  // Agginym Specific stuff
+  if (opts.creatorPublicKey !== undefined) torrent['creator_public_key'] = opts.creatorPublicKey; // key for verifying updates
+  if (opts.groupPublicKey !== undefined) torrent['group_public_key'] = opts.groupPublicKey;  // only those in the group (sig verified) can share
+  if (opts.updateType !== undefined) torrent['update type'] = opts.updateType; // append: reference old files in new torrent, replace: next version, no references, none: no updates
+  if (opts.versionNumber !== undefined) torrent['version number'] = opts.versionNumber; // versions are ints and only go up.
+  if (opts.newVersionId !== undefined) torrent['new version id'] = opts.newVersionId; // agginym lookup id for the new version
+  if (opts.creatorMetaSignature !== undefined) torrent['meta signature'] = opts.creatorMetaSignature; // make sure the meta doesn't change.  necessary for agginym features.  many leave comment alone?
+  if (opts.chunkMinSize !== undefined) torrent['chunk minimum size'] = opts.chunkMinSize;
+  if (opts.groupFingerprint !== undefined) torrent['group_fingerprint'] = opts.groupFingerprint;
+  
+  const pieceLength = opts.pieceLength || calcPieceLength(files.reduce(sumLength, 0));
+  const chunkMinSize = opts.chunkMinSize;
+  torrent.info['piece length'] = pieceLength;
 
-  getPieceList(files, pieceLength, (err, pieces, torrentLength) => {
-    if (err) return cb(err)
-    torrent.info.pieces = pieces
+  let password = genpass();
+  let outer_password = genpass();
 
-    files.forEach(file => {
-      delete file.getStream
-    })
+  let local_torrent_key = await getUniqueStorageId(torrent_store);
 
-    if (opts.singleFileTorrent) {
-      torrent.info.length = torrentLength
-    } else {
-      torrent.info.files = files
+  let upload_key = await getUniqueStorageId(upload_store);
+
+  console.log("local torrent key");
+  console.log(local_torrent_key);
+  let agginym_torrent = new AgginymTorrent(
+    obj={},
+    local_key=local_torrent_key,
+    local_upload_keys=[upload_key],
+    pass=password,
+    outer_pass=outer_password,
+    uploader=opts.creatorPublicKey
+  );
+  console.log("setting torrent");
+  console.log(AgginymTorrent.store);
+  console.log(agginym_torrent.store);
+  await agginym_torrent.setItem();
+  console.log("done setting torrent");
+  // get all agginym handles
+  let agginym_files = [];
+
+
+  for(f of files){
+    let thekey = await getUniqueStorageId(file_store);
+    console.log("%%%%%%%%%%%%%%%%%");
+    console.log("NEW FILE KEY", thekey);
+    let thepath = f.path[0];
+    console.log("path:", f.path);
+    let agginym_file = new AgginymFile(
+        obj={},
+        local_key=thekey,
+        name=thepath,
+        local_torrent_keys=[local_torrent_key], //agginym_torrent.local_key
+        local_upload_keys=[upload_key],
+        circle_fingerprint=opts.groupFingerprint,
+        chunks = new Array()
+      );
+    console.log(agginym_file);
+    await agginym_file.setItem();
+    console.log(agginym_file);
+    console.log("%%%%%%%%%%%%%%%%%");
+    agginym_files.push(agginym_file);
+  }
+
+  console.log("LOCALTORRENTKEY");
+  console.log(local_torrent_key);
+  let upload_instance = new UploadInstance(
+    obj={},
+    local_key=upload_key,
+    circle_fingerprint=opts.groupFingerprint,
+    local_file_keys=agginym_files.map(fi => fi.local_key),
+    local_torrent_key=local_torrent_key
+  );
+
+  console.log("***");
+  upload_instance.local_torrent_key = local_torrent_key;
+  console.log(agginym_files);
+  console.log(upload_instance);
+  console.log(agginym_torrent);
+  console.log("***");
+  await upload_instance.setItem();
+
+  console.log("files:", files);
+  console.log("upload_instance:", upload_instance);
+  let currently_saving = new Set();
+  getPieceList(upload_instance, files, chunkMinSize, pieceLength, use_storage, async (err, pieces, main_chunk_size, blob_key_array, torrentLength) => {
+    if (err) return cb(err);
+    torrent.info.pieces = pieces;
+    torrent.fileChunks = []; // this holds all of the chunks in objects '{name:,chunk_list:[{}]}'
+    torrent.pieceLength = pieceLength;
+    torrent.chunkSize = main_chunk_size;
+    let chunk_bytes_seen = 0;
+    let file_bytes_seen = 0;
+    let file_bytes_matched = 0;
+    let file_count = 0;
+    console.log("blob_key_array", blob_key_array);
+    let startwaittime = new Date.getTime();
+    while(currently_saving.size > 0){
+      let endwaittime = new Date.getTime();
+      console.log(`${endwaittime-startwaittime/1000} seconds have passed, ${currently_saving.size} chunks are still being loaded into aggynym system`);
+      console.log(currently_saving);
+    }
+    for(let blob_data of blob_key_array){
+      console.log("blob_data", blob_data);
+      // create the FileChunks for the blobs.
+      let local_chunk_key = await getUniqueStorageId(chunk_store);
+      let file_chunk = new FileChunk(
+        obj={},
+        local_key=local_chunk_key,
+        local_torrent_key=upload_instance.local_torrent_key,
+        local_blob_key=blob_data.key,
+        local_file_keys=new Array(),
+        hash = blob_data.hash,
+        password=agginym_torrent.password,
+        outer_password=agginym_torrent.outer_password,
+        start_piece=Math.floor(chunk_bytes_seen / pieceLength),
+        end_piece=Math.floor((main_chunk_size+chunk_bytes_seen) / pieceLength)
+      );
+      chunk_bytes_seen += main_chunk_size;
+      if (!Array.isArray(file_chunk.local_file_keys)){
+        file_chunk.local_file_keys = new Array();
+      }
+      // Match up Files and FileChunks
+      while(file_count < files.length){
+        if (chunk_bytes_seen >= file_bytes_seen + files[file_count].length){
+          let stored_file = await AgginymFile.getItem(upload_instance.local_file_keys[file_count]);
+          //if (!Array.isArray)
+          file_chunk.local_file_keys.push(stored_file.local_key);
+          stored_file.chunks.push(file_chunk.local_key);
+          console.log(stored_file);
+          await stored_file.setItem();
+          file_bytes_seen += files[file_count].length;
+          ++file_count;
+        }
+        else if(chunk_bytes_seen < file_bytes_seen + files[file_count].length){
+          let stored_file = await AgginymFile.getItem(upload_instance.local_file_keys[file_count]);
+          console.log("stored_file:::", stored_file);
+          file_chunk.local_file_keys.push(stored_file.local_key);
+          console.log(stored_file instanceof AgginymFile);
+          stored_file.chunks.push(file_chunk.local_key);
+          console.log(stored_file);
+          await stored_file.setItem();
+          break;
+        }
+      }
+
+      await file_chunk.setItem();
     }
 
-    cb(null, bencode.encode(torrent))
-  })
+
+    files.forEach(file => {
+      delete file.getStream;
+    });
+
+    if (opts.singleFileTorrent) {
+      torrent.info.length = torrentLength;
+    } else {
+      torrent.info.files = files;
+    }
+
+    agginym_torrent.raw = torrent;
+    await agginym_torrent.setItem();
+
+    if (raw){
+      console.log("raw is true");
+
+      cb(null, upload_instance, pass_object); // the torrent will be encoded after uploading.
+    } 
+    else{
+      cb(null, bencode.encode(torrent));
+    }
+  });
 }
 
 /**
@@ -488,6 +713,9 @@ function getStreamStream (readable, file) {
   }
 }
 
-module.exports = createTorrent
-module.exports.parseInput = parseInput
-module.exports.announceList = announceList
+module.exports = {createTorrent: createTorrent};
+module.exports.FileReadStream = FileReadStream;
+module.exports.Bencode = bencode.encode;
+module.exports.Dencode = bencode.decode;
+module.exports.parseInput = parseInput;
+module.exports.announceList = announceList;
